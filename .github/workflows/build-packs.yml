@@ -74,8 +74,13 @@ jobs:
                "https://download.geofabrik.de/$REGION-latest.osm.pbf" \
           || curl -fL --retry 3 -A "$UA" -o data/$ID.osm.pbf \
                "https://download.openstreetmap.fr/extracts/$REGION-latest.osm.pbf"
+          # make sure we got a real OSM file (not a web page); otherwise use the mirror
+          if ! head -c 64 data/$ID.osm.pbf | grep -q OSMHeader; then
+            echo "Geofabrik returned no OSM data - using mirror"
+            curl -fL --retry 3 -A "$UA" -o data/$ID.osm.pbf "https://download.openstreetmap.fr/extracts/$REGION-latest.osm.pbf"
+          fi
           ls -la data
-          test -s data/$ID.osm.pbf
+          head -c 64 data/$ID.osm.pbf | grep -q OSMHeader
       - name: Map tiles (Planetiler)
         run: |
           curl -fL --retry 3 -o planetiler.jar https://github.com/onthegomap/planetiler/releases/latest/download/planetiler.jar
