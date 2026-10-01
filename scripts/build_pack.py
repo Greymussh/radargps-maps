@@ -9,8 +9,8 @@ Reads one OpenStreetMap extract (.osm.pbf) and writes, into OUT_DIR:
 The map tiles (<id>.mbtiles) are built separately with Planetiler.
 
 FORMAT of .route (little endian):
-  b'RGR1', int32 version=1
-  int32 nV, nE, nG, nAdj, namesBytes
+  b'RGR2', int32 version=2
+  int32 nV, nE, nAdj, geomBytes, namesBytes
   int32[nV*2]   vertex lat*1e6, lon*1e6
   int32[nV+1]   adjacency offsets into adj[]
   int32[nAdj]   adj entries: edge*2 + dir  (dir 0 = from->to, 1 = to->from)
@@ -19,10 +19,10 @@ FORMAT of .route (little endian):
   float32[nE]   length (m)
   float32[nE]   travel time (s)
   int32[nE]     name index (-1 = unnamed)
-  int32[nE]     geometry start (point index)
-  int32[nE]     geometry point count
+  int32[nE+1]   byte offset of each edge's geometry in the geometry blob
   uint8[nE]     flags: 1 = oneway (from->to only), 2 = roundabout, bits 4..7 = road class
-  int32[nG*2]   geometry lat*1e6, lon*1e6
+  bytes         geometry: per edge, the points between its two vertices as zigzag-varint
+                deltas (lat, lon, in 1e-6 degrees) starting from the 'from' vertex
   bytes         names, utf-8, each terminated by \\0
 
 Text normalisation (norm()) MUST stay identical to Pack.norm() in the Android app.
@@ -220,13 +220,26 @@ def haversine(a, b):
     return 2 * R * math.asin(min(1, math.sqrt(h)))
 
 
+def zz(v):
+    return (v << 1) ^ (v >> 63)
+
+
+def put_varint(buf, v):
+    while v >= 0x80:
+        buf.append((v & 0x7f) | 0x80)
+        v >>= 7
+    buf.append(v)
+
+
 def build_graph(c, out_path):
     vid = {}
     vlat, vlon = array('i'), array('i')
-    efrom, eto, elen, etime, ename, egs, egc = (array('i'), array('i'), array('f'), array('f'), array('i'), array('i'), array('i'))
+    efrom, eto, elen, etime, ename = (array('i'), array('i'), array('f'), array('f'), array('i'))
+    goff = array('i', [0])
     eflag = bytearray()
-    glat, glon = array('i'), array('i')
+    geom = bytearray()
     names, name_idx = [], {}
+    npts = 0
 
     def vertex(nid, p):
         v = vid.get(nid)
@@ -254,9 +267,14 @@ def build_graph(c, out_path):
                     a = vertex(ids[start], seg[0]); b = vertex(ids[i], seg[-1])
                     efrom.append(a); eto.append(b); elen.append(length)
                     etime.append(length / (sp / 3.6)); ename.append(ni)
-                    egs.append(len(glat)); egc.append(len(seg))
-                    for p in seg:
-                        glat.append(int(round(p[0] * 1e6))); glon.append(int(round(p[1] * 1e6)))
+                    # intermediate points only, delta + zigzag varint from the start vertex
+                    pl, pn = vlat[a], vlon[a]
+                    for p in seg[1:-1]:
+                        la, lo = int(round(p[0] * 1e6)), int(round(p[1] * 1e6))
+                        put_varint(geom, zz(la - pl)); put_varint(geom, zz(lo - pn))
+                        pl, pn = la, lo
+                        npts += 1
+                    goff.append(len(geom))
                     eflag.append((1 if oneway else 0) | (2 if rb else 0) | (cls << 4))
             start = i
 
@@ -272,19 +290,21 @@ def build_graph(c, out_path):
     vert = array('i')
     for i in range(nV):
         vert.append(vlat[i]); vert.append(vlon[i])
-    geom = array('i')
-    for i in range(len(glat)):
-        geom.append(glat[i]); geom.append(glon[i])
     nb = b''.join(n.encode('utf-8') + b'\0' for n in names)
-    for arr in (vert, off, adj, efrom, eto, elen, etime, ename, egs, egc, geom):
-        if sys.byteorder != 'little':
+    arrs = (vert, off, adj, efrom, eto, elen, etime, ename, goff)
+    if sys.byteorder != 'little':
+        for arr in arrs:
             arr.byteswap()
     with open(out_path, 'wb') as f:
-        f.write(b'RGR1'); f.write(struct.pack('<6i', 1, nV, nE, len(glat), len(adj), len(nb)))
-        for arr in (vert, off, adj, efrom, eto, elen, etime, ename, egs, egc):
+        f.write(b'RGR2'); f.write(struct.pack('<6i', 2, nV, nE, len(adj), len(geom), len(nb)))
+        for arr in arrs:
             f.write(arr.tobytes())
-        f.write(bytes(eflag)); f.write(geom.tobytes()); f.write(nb)
-    return nV, nE, len(glat)
+        f.write(bytes(eflag)); f.write(bytes(geom)); f.write(nb)
+    return nV, nE, npts
+
+
+DROP_TAGS = ('name:ka', 'name:ru', 'public_transport', 'station', 'addr:housenumber', 'addr:street', 'addr:city')
+KIND = {'place': 1, 'poi': 2, 'street': 3, 'address': 4}
 
 
 def build_search(c, out_path, bbox):
@@ -294,51 +314,68 @@ def build_search(c, out_path, bbox):
     db.executescript('''
       PRAGMA page_size=4096; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;
       CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
-      CREATE TABLE places(id INTEGER PRIMARY KEY, name TEXT, latin TEXT, kind TEXT, sub TEXT, lat REAL, lon REAL,
-                          rank INTEGER, addr TEXT, tags TEXT);
-      CREATE TABLE tok(t TEXT, id INTEGER);
-      CREATE TABLE spts(c INTEGER, lat REAL, lon REAL, name TEXT, latin TEXT);
+      CREATE TABLE names(id INTEGER PRIMARY KEY, name TEXT, latin TEXT);
+      CREATE TABLE places(id INTEGER PRIMARY KEY, name TEXT, latin TEXT, kind INTEGER, sub TEXT,
+                          lat INTEGER, lon INTEGER, rank INTEGER, sid INTEGER, tags TEXT);
+      CREATE TABLE tok(t TEXT, id INTEGER, PRIMARY KEY(t, id)) WITHOUT ROWID;
+      CREATE TABLE spts(c INTEGER, sid INTEGER, lat INTEGER, lon INTEGER, PRIMARY KEY(c, sid)) WITHOUT ROWID;
     ''')
-    rows = []
+    # street names, stored once
+    sids = {}
+
+    def sid_of(name):
+        i = sids.get(name)
+        if i is None:
+            i = len(sids) + 1
+            sids[name] = i
+            lt = latin_title(name)
+            db.execute('INSERT INTO names VALUES(?,?,?)', (i, name, lt if lt != name else None))
+        return i
+
+    E6 = lambda v: int(round(v * 1e6))
+    rows = []   # (name, latin, kind, sub, lat, lon, rank, sid, tags, words)
     for p in c.places:
-        rows.append(p)
-    # streets: one searchable entry per name per ~2 km cluster
-    seen = {}
-    for (cell, name), (lat, lon) in c.street_pts.items():
-        k = (name, cell[0] // 10, cell[1] // 10)
-        if k not in seen:
-            seen[k] = 1
-            rows.append(dict(name=name, name_en='', kind='street', sub='street', key='highway', lat=lat, lon=lon,
-                             rank=45, tags={}, addr=''))
-    for (st, hn), (lat, lon, city) in c.addrs.items():
-        rows.append(dict(name=st + ' ' + hn, name_en='', kind='address', sub='address', key='addr', lat=lat, lon=lon,
-                         rank=20, tags={'addr:city': city} if city else {}, addr=''))
-    toks = []
-    for i, p in enumerate(rows, 1):
+        tags = {k: v for k, v in p['tags'].items() if k not in DROP_TAGS}
+        if p['key'] == 'highway':
+            tags = {}
+        if p.get('addr'):
+            tags['addr'] = p['addr']
         latin = p['name_en'] or latin_title(p['name'])
-        db.execute('INSERT INTO places VALUES(?,?,?,?,?,?,?,?,?,?)',
-                   (i, p['name'], latin if latin != p['name'] else '', p['kind'], p['sub'], round(p['lat'], 7),
-                    round(p['lon'], 7), p['rank'], p['addr'], json.dumps(p['tags'], ensure_ascii=False) if p['tags'] else ''))
         words = set(tokens(p['name']) + tokens(p['name_en']))
         if p['kind'] == 'poi':
             words |= set(tokens(p['sub'].replace('_', ' ')))
             for cu in (p['tags'].get('cuisine') or '').split(';'):
                 words |= set(tokens(cu.replace('_', ' ')))
             words |= set(tokens(p['tags'].get('brand') or ''))
-        for w in words:
-            toks.append((w, i))
-    db.executemany('INSERT INTO tok VALUES(?,?)', toks)
+        rows.append((p['name'] or None, latin if latin and latin != p['name'] else None, KIND[p['kind']], p['sub'],
+                     E6(p['lat']), E6(p['lon']), p['rank'], None,
+                     json.dumps(tags, ensure_ascii=False, separators=(',', ':')) if tags else None, words))
+    # streets: one searchable entry per name per ~2 km cluster
+    seen = set()
+    for (cell, name), (lat, lon) in c.street_pts.items():
+        k = (name, cell[0] // 10, cell[1] // 10)
+        if k in seen:
+            continue
+        seen.add(k)
+        rows.append((None, None, 3, None, E6(lat), E6(lon), 45, sid_of(name), None, set(tokens(name) + tokens(latin_title(name)))))
+    for (st, hn), (lat, lon, city) in c.addrs.items():
+        rows.append((hn, None, 4, None, E6(lat), E6(lon), 20, sid_of(st), None, None))
+    toks = []
+    for i, r in enumerate(rows, 1):
+        db.execute('INSERT INTO places VALUES(?,?,?,?,?,?,?,?,?,?)', (i,) + r[:9])
+        if r[9]:
+            for w in r[9]:
+                toks.append((w, i))
+    db.executemany('INSERT OR IGNORE INTO tok VALUES(?,?)', toks)
     sp = []
     for (cell, name), (lat, lon) in c.street_pts.items():
-        lt = latin_title(name)
-        sp.append(((cell[0] + 100000) * 1000000 + (cell[1] + 100000), round(lat, 7), round(lon, 7), name, lt if lt != name else ''))
-    db.executemany('INSERT INTO spts VALUES(?,?,?,?,?)', sp)
+        sp.append(((cell[0] + 100000) * 1000000 + (cell[1] + 100000), sid_of(name), E6(lat), E6(lon)))
+    db.executemany('INSERT OR IGNORE INTO spts VALUES(?,?,?,?)', sp)
     db.executescript('''
-      CREATE INDEX tok_t ON tok(t);
-      CREATE INDEX spts_c ON spts(c);
       CREATE INDEX places_ll ON places(lat, lon);
+      CREATE INDEX places_addr ON places(sid, name) WHERE kind=4;
     ''')
-    db.executemany('INSERT INTO meta VALUES(?,?)', [('version', '1'), ('bbox', json.dumps(bbox)),
+    db.executemany('INSERT INTO meta VALUES(?,?)', [('version', '2'), ('bbox', json.dumps(bbox)),
                                                      ('places', str(len(rows)))])
     db.commit()
     db.execute('VACUUM')
