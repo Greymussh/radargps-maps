@@ -1,0 +1,2 @@
+# One Geofabrik region per line (see https://download.geofabrik.de/). Built monthly.
+asia/georgia
