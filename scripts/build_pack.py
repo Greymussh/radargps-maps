@@ -355,9 +355,14 @@ def main():
     c = Collector()
     idx = 'flex_mem'
     c.apply_file(pbf, locations=True, idx=idx)
-    lats = [p['lat'] for p in c.places] + [w[1][0][0] for w in c.ways]
-    lons = [p['lon'] for p in c.places] + [w[1][0][1] for w in c.ways]
-    bbox = [min(lons), min(lats), max(lons), max(lats)] if lats else [0, 0, 0, 0]
+    # coverage box from the road network, ignoring stray outliers (0.05% each side) + small margin
+    lats = sorted(pt[0] for w in c.ways for pt in w[1][::4])
+    lons = sorted(pt[1] for w in c.ways for pt in w[1][::4])
+    if lats:
+        k = int(len(lats) * 0.0005)
+        bbox = [lons[k] - 0.05, lats[k] - 0.05, lons[-1 - k] + 0.05, lats[-1 - k] + 0.05]
+    else:
+        bbox = [0, 0, 0, 0]
     g = build_graph(c, os.path.join(out, pid + '.route'))
     s = build_search(c, os.path.join(out, pid + '.search'), bbox)
     info = dict(id=pid, bbox=[round(x, 5) for x in bbox], vertices=g[0], edges=g[1], points=g[2], places=s[0])
