@@ -68,8 +68,14 @@ jobs:
           ID="${REGION##*/}"
           echo "ID=$ID" >> "$GITHUB_ENV"
           mkdir -p data out
-          curl -fL --retry 3 -o data/$ID.osm.pbf "https://download.geofabrik.de/$REGION-latest.osm.pbf"
+          UA="Mozilla/5.0 (radargps-maps pack builder; github.com/$GITHUB_REPOSITORY)"
+          # Geofabrik first (keeps cookies: it uses a redirect check), then the OpenStreetMap France mirror
+          curl -fL --retry 3 --max-redirs 10 -c cj.txt -b cj.txt -A "$UA" -o data/$ID.osm.pbf \
+               "https://download.geofabrik.de/$REGION-latest.osm.pbf" \
+          || curl -fL --retry 3 -A "$UA" -o data/$ID.osm.pbf \
+               "https://download.openstreetmap.fr/extracts/$REGION-latest.osm.pbf"
           ls -la data
+          test -s data/$ID.osm.pbf
       - name: Map tiles (Planetiler)
         run: |
           curl -fL --retry 3 -o planetiler.jar https://github.com/onthegomap/planetiler/releases/latest/download/planetiler.jar
