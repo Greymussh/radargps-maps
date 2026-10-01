@@ -80,7 +80,9 @@ jobs:
         run: |
           curl -fL --retry 3 -o planetiler.jar https://github.com/onthegomap/planetiler/releases/latest/download/planetiler.jar
           java -Xmx10g -jar planetiler.jar --osm-path=data/$ID.osm.pbf --output=out/$ID.mbtiles \
-            --download --force --maxzoom=14 --nodemap-type=sparsearray --storage=mmap
+            --download --force --maxzoom=14 --nodemap-type=sparsearray --storage=mmap \
+            --languages=en --exclude_layers=housenumber,mountain_peak,aerodrome_label,water_name,boundary \
+            --exclude_ids=true --max_point_buffer=4 --simplify_tolerance_at_max_zoom=0.125
           ls -la out
       - name: Routing + search
         run: python3 scripts/build_pack.py data/$ID.osm.pbf $ID out
