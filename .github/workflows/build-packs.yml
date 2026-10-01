@@ -1,0 +1,144 @@
+name: Build map packs
+
+# Builds offline country packs for Radar GPS from OpenStreetMap (Geofabrik extracts)
+# and publishes them as GitHub Releases. Runs on demand and once a month.
+on:
+  workflow_dispatch:
+    inputs:
+      countries:
+        description: 'Geofabrik regions, comma separated (e.g. asia/georgia,asia/armenia). Empty = all in countries.txt'
+        required: false
+        default: ''
+  schedule:
+    - cron: '17 3 1 * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: packs
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: m
+        env:
+          INPUT: ${{ github.event.inputs.countries }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          raw = os.environ.get('INPUT', '').strip()
+          regions = [r.strip() for r in raw.split(',') if r.strip()] if raw else \
+                    [l.strip() for l in open('countries.txt') if l.strip() and not l.startswith('#')]
+          print('matrix=' + json.dumps({'region': regions}))
+          EOF
+
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REGION: ${{ matrix.region }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+      - name: Prepare
+        run: |
+          pip install osmium
+          ID="${REGION##*/}"
+          echo "ID=$ID" >> "$GITHUB_ENV"
+          mkdir -p data out
+          curl -fL --retry 3 -o data/$ID.osm.pbf "https://download.geofabrik.de/$REGION-latest.osm.pbf"
+          ls -la data
+      - name: Map tiles (Planetiler)
+        run: |
+          curl -fL --retry 3 -o planetiler.jar https://github.com/onthegomap/planetiler/releases/latest/download/planetiler.jar
+          java -Xmx10g -jar planetiler.jar --osm-path=data/$ID.osm.pbf --output=out/$ID.mbtiles \
+            --download --force --maxzoom=14 --nodemap-type=sparsearray --storage=mmap
+          ls -la out
+      - name: Routing + search
+        run: python3 scripts/build_pack.py data/$ID.osm.pbf $ID out
+      - name: Package
+        run: |
+          cd out
+          gzip -9 -k $ID.route
+          gzip -9 -k $ID.search
+          python3 - <<'EOF'
+          import json, os, datetime
+          pid = os.environ['ID']; region = os.environ['REGION']
+          info = json.load(open(pid + '.json'))
+          name = pid.replace('-', ' ').title()
+          def f(n): return {'file': n, 'size': os.path.getsize(n)}
+          info.update(name=name, region=region, built=datetime.date.today().isoformat(),
+                      files={'map': f(pid + '.mbtiles'), 'route': f(pid + '.route.gz'), 'search': f(pid + '.search.gz')},
+                      unpacked={'route': os.path.getsize(pid + '.route'), 'search': os.path.getsize(pid + '.search')})
+          json.dump(info, open(pid + '.json', 'w'), indent=1)
+          print(json.dumps(info, indent=1))
+          EOF
+      - name: Publish
+        run: |
+          TAG="pack-$ID"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Map pack: $ID" --notes "Offline map pack for $REGION. Map data © OpenStreetMap contributors (ODbL)."
+          gh release upload "$TAG" out/$ID.mbtiles out/$ID.route.gz out/$ID.search.gz out/$ID.json --clobber
+
+  index:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fonts (once)
+        run: |
+          if ! gh release view fonts >/dev/null 2>&1; then
+            curl -fL --retry 3 -o f.zip https://github.com/openmaptiles/fonts/releases/download/v2.0/v2.0.zip
+            mkdir -p f && cd f && unzip -q ../f.zip && cd ..
+            mkdir -p fonts && cp -r "f/Noto Sans Regular" "f/Noto Sans Bold" fonts/ 2>/dev/null || find f -maxdepth 2 -type d | head
+            (cd fonts && zip -qr ../fonts.zip .)
+            gh release create fonts --title "Map fonts" --notes "Label fonts (Noto Sans, OFL) for offline maps." fonts.zip
+          fi
+      - name: Index
+        run: |
+          mkdir -p idx && cd idx
+          for t in $(gh release list --limit 300 --json tagName --jq '.[].tagName' | grep '^pack-'); do
+            id="${t#pack-}"
+            gh release download "$t" -p "$id.json" --clobber || true
+          done
+          python3 - <<'EOF'
+          import json, glob, os, datetime
+          repo = os.environ['GITHUB_REPOSITORY']
+          base = f'https://github.com/{repo}/releases/download'
+          packs = []
+          for fn in sorted(glob.glob('*.json')):
+              p = json.load(open(fn))
+              for k, v in p['files'].items():
+                  v['url'] = f"{base}/pack-{p['id']}/{v['file']}"
+              packs.append(p)
+          idx = {'version': 1, 'updated': datetime.date.today().isoformat(), 'fonts': f'{base}/fonts/fonts.zip',
+                 'attribution': '© OpenStreetMap contributors', 'packs': packs}
+          json.dump(idx, open('index.json', 'w'), indent=1)
+          print(json.dumps(idx, indent=1))
+          EOF
+          gh release view index >/dev/null 2>&1 || gh release create index --title "Pack index" --notes "List of available map packs (read by the app)."
+          gh release upload index index.json --clobber
