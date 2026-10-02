@@ -125,6 +125,11 @@ jobs:
           ls -la out
       - name: Routing + search
         run: python3 scripts/build_pack.py data/$ID.osm.pbf $ID out
+      - name: Terrain (3D mountains, contours)
+        continue-on-error: true
+        run: |
+          pip install pillow
+          timeout 80m python3 scripts/build_dem.py out/$ID.search $ID out
       - name: Package
         run: |
           cd out
@@ -139,6 +144,8 @@ jobs:
                       region=os.environ['REGION'], built=datetime.date.today().isoformat(),
                       files={'map': f(pid + '.mbtiles'), 'route': f(pid + '.route.gz'), 'search': f(pid + '.search.gz')},
                       unpacked={'route': os.path.getsize(pid + '.route'), 'search': os.path.getsize(pid + '.search')})
+          if os.path.exists(pid + '.dem.mbtiles'):
+              info['files']['dem'] = f(pid + '.dem.mbtiles')
           for v in info['files'].values():
               assert v['size'] < 2_000_000_000, 'file too big for a GitHub release: ' + v['file']
           json.dump(info, open(pid + '.json', 'w'), indent=1)
@@ -148,7 +155,8 @@ jobs:
         run: |
           TAG="pack-$ID"
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Map pack: $PNAME ($COUNTRY)" --notes "Offline map pack for $REGION. Map data © OpenStreetMap contributors (ODbL)."
-          gh release upload "$TAG" out/$ID.mbtiles out/$ID.route.gz out/$ID.search.gz out/$ID.json --clobber
+          EXTRA=""; [ -f out/$ID.dem.mbtiles ] && EXTRA="out/$ID.dem.mbtiles"
+          gh release upload "$TAG" out/$ID.mbtiles out/$ID.route.gz out/$ID.search.gz out/$ID.json $EXTRA --clobber
 
   index:
     needs: build
@@ -203,7 +211,7 @@ jobs:
               p.setdefault('country', p.get('name', p['id']))
               p.setdefault('continent', 'asia')
               p['continentName'] = names.get(p['continent'], p['continent'])
-              p['size'] = sum(v['size'] for v in p['files'].values())
+              p['size'] = sum(v['size'] for k, v in p['files'].items() if k != 'dem')
               packs.append(p)
           packs.sort(key=lambda p: (p['continentName'], p['country'], p['name']))
           idx = {'version': 2, 'updated': datetime.date.today().isoformat(), 'fonts': f'{base}/fonts-lite/fonts.zip',
