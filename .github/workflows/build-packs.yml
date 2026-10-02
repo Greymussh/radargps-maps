@@ -1,54 +1,89 @@
 name: Build map packs
 
-# Builds offline country packs for Radar GPS from OpenStreetMap (Geofabrik extracts)
-# and publishes them as GitHub Releases. Runs on demand and once a month.
+# Builds offline map packs for Waypoint from OpenStreetMap (Geofabrik extracts)
+# and publishes them as GitHub Releases. The list of packs comes from scripts/plan_regions.py.
+#
+# "packs" input, comma separated, any mix of:
+#   a pack id (georgia, us-texas, kanto), a country (Georgia, United States),
+#   a continent (asia, europe, north-america, south-america, central-america, australia-oceania), or all
+# Packs built less than "skip_days" days ago are skipped (0 = rebuild everything selected).
+# One run builds at most 250 packs (GitHub's limit); run again to continue.
 on:
   workflow_dispatch:
     inputs:
-      countries:
-        description: 'Geofabrik regions, comma separated (e.g. asia/georgia,asia/armenia). Empty = all in countries.txt'
+      packs:
+        description: 'Packs: ids, countries, continents or all (comma separated)'
         required: false
-        default: ''
+        default: 'georgia'
+      skip_days:
+        description: 'Skip packs built within this many days'
+        required: false
+        default: '0'
   schedule:
-    - cron: '17 3 1 * *'
+    - cron: '17 3 * * 0'     # every Sunday: refresh up to 250 packs older than 25 days
 
 permissions:
   contents: write
-
-concurrency:
-  group: packs
-  cancel-in-progress: false
 
 jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.m.outputs.matrix }}
+      count: ${{ steps.m.outputs.count }}
     steps:
       - uses: actions/checkout@v4
-      - id: m
+      - name: Plan packs
+        id: m
         env:
-          INPUT: ${{ github.event.inputs.countries }}
+          PACKS: ${{ github.event.inputs.packs || 'all' }}
+          SKIP_DAYS: ${{ github.event.inputs.skip_days || '25' }}
         run: |
+          python3 scripts/plan_regions.py regions.json
+          curl -sfL "https://github.com/$GITHUB_REPOSITORY/releases/download/index/index.json" -o old_index.json || echo '{"packs":[]}' > old_index.json
           python3 - <<'EOF' >> "$GITHUB_OUTPUT"
-          import json, os
-          raw = os.environ.get('INPUT', '').strip()
-          regions = [r.strip() for r in raw.split(',') if r.strip()] if raw else \
-                    [l.strip() for l in open('countries.txt') if l.strip() and not l.startswith('#')]
-          print('matrix=' + json.dumps({'region': regions}))
+          import json, os, sys, datetime
+          regions = json.load(open('regions.json'))
+          built = {p['id']: p.get('built', '') for p in json.load(open('old_index.json')).get('packs', [])}
+          want = [w.strip() for w in os.environ['PACKS'].split(',') if w.strip()]
+          low = lambda s: s.lower().replace(' ', '-')
+          sel = []
+          for r in regions:
+              keys = {low(r['id']), low(r['country']), low(r['continent']), low(r['region']), 'all'}
+              if any(low(w) in keys for w in want):
+                  sel.append(r)
+          days = int(os.environ['SKIP_DAYS'] or 0)
+          if days > 0:
+              cut = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+              sel = [r for r in sel if built.get(r['id'], '') < cut]
+          sel.sort(key=lambda r: built.get(r['id'], ''))      # never built / oldest first
+          sel = sel[:250]
+          print('selected', len(sel), 'packs:', ' '.join(r['id'] for r in sel), file=sys.stderr)
+          print('matrix=' + json.dumps({'pack': sel}))
+          print('count=' + str(len(sel)))
           EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: regions
+          path: regions.json
 
   build:
     needs: plan
+    if: needs.plan.outputs.count != '0'
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 340
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 16
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    name: ${{ matrix.pack.id }}
     env:
       GH_TOKEN: ${{ github.token }}
-      REGION: ${{ matrix.region }}
+      REGION: ${{ matrix.pack.region }}
+      ID: ${{ matrix.pack.id }}
+      PNAME: ${{ matrix.pack.name }}
+      COUNTRY: ${{ matrix.pack.country }}
+      CONTINENT: ${{ matrix.pack.continent }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -62,29 +97,28 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
           df -h /
-      - name: Prepare
+      - name: Planetiler sources cache (water, borders)
+        uses: actions/cache@v4
+        with:
+          path: data/sources
+          key: planetiler-sources-v1
+      - name: Download OSM data
         run: |
           pip install osmium
-          ID="${REGION##*/}"
-          echo "ID=$ID" >> "$GITHUB_ENV"
           mkdir -p data out
-          UA="Mozilla/5.0 (radargps-maps pack builder; github.com/$GITHUB_REPOSITORY)"
-          # Geofabrik first (keeps cookies: it uses a redirect check), then the OpenStreetMap France mirror
-          curl -fL --retry 3 --max-redirs 10 -c cj.txt -b cj.txt -A "$UA" -o data/$ID.osm.pbf \
-               "https://download.geofabrik.de/$REGION-latest.osm.pbf" \
-          || curl -fL --retry 3 -A "$UA" -o data/$ID.osm.pbf \
-               "https://download.openstreetmap.fr/extracts/$REGION-latest.osm.pbf"
-          # make sure we got a real OSM file (not a web page); otherwise use the mirror
-          if ! head -c 64 data/$ID.osm.pbf | grep -q OSMHeader; then
-            echo "Geofabrik returned no OSM data - using mirror"
-            curl -fL --retry 3 -A "$UA" -o data/$ID.osm.pbf "https://download.openstreetmap.fr/extracts/$REGION-latest.osm.pbf"
+          UA="Mozilla/5.0 (map pack builder; github.com/$GITHUB_REPOSITORY)"
+          F=data/$ID.osm.pbf
+          curl -fL --retry 3 --max-redirs 10 -c cj.txt -b cj.txt -A "$UA" -o $F "https://download.geofabrik.de/$REGION-latest.osm.pbf" || true
+          if ! head -c 64 $F 2>/dev/null | grep -q OSMHeader; then
+            echo "Geofabrik gave no OSM data - using the mirror"
+            curl -fL --retry 3 -A "$UA" -o $F "https://download.openstreetmap.fr/extracts/$REGION-latest.osm.pbf"
           fi
           ls -la data
-          head -c 64 data/$ID.osm.pbf | grep -q OSMHeader
+          head -c 64 $F | grep -q OSMHeader
       - name: Map tiles (Planetiler)
         run: |
           curl -fL --retry 3 -o planetiler.jar https://github.com/onthegomap/planetiler/releases/latest/download/planetiler.jar
-          java -Xmx10g -jar planetiler.jar --osm-path=data/$ID.osm.pbf --output=out/$ID.mbtiles \
+          java -Xmx11g -jar planetiler.jar --osm-path=data/$ID.osm.pbf --output=out/$ID.mbtiles \
             --download --force --maxzoom=14 --nodemap-type=sparsearray --storage=mmap \
             --languages=en --exclude_layers=housenumber,mountain_peak,aerodrome_label,water_name,boundary \
             --exclude_ids=true --max_point_buffer=4 --simplify_tolerance_at_max_zoom=0.125
@@ -98,26 +132,31 @@ jobs:
           gzip -9 -k $ID.search
           python3 - <<'EOF'
           import json, os, datetime
-          pid = os.environ['ID']; region = os.environ['REGION']
+          pid = os.environ['ID']
           info = json.load(open(pid + '.json'))
-          name = pid.replace('-', ' ').title()
           def f(n): return {'file': n, 'size': os.path.getsize(n)}
-          info.update(name=name, region=region, built=datetime.date.today().isoformat(),
+          info.update(name=os.environ['PNAME'], country=os.environ['COUNTRY'], continent=os.environ['CONTINENT'],
+                      region=os.environ['REGION'], built=datetime.date.today().isoformat(),
                       files={'map': f(pid + '.mbtiles'), 'route': f(pid + '.route.gz'), 'search': f(pid + '.search.gz')},
                       unpacked={'route': os.path.getsize(pid + '.route'), 'search': os.path.getsize(pid + '.search')})
+          for v in info['files'].values():
+              assert v['size'] < 2_000_000_000, 'file too big for a GitHub release: ' + v['file']
           json.dump(info, open(pid + '.json', 'w'), indent=1)
           print(json.dumps(info, indent=1))
           EOF
       - name: Publish
         run: |
           TAG="pack-$ID"
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Map pack: $ID" --notes "Offline map pack for $REGION. Map data © OpenStreetMap contributors (ODbL)."
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Map pack: $PNAME ($COUNTRY)" --notes "Offline map pack for $REGION. Map data © OpenStreetMap contributors (ODbL)."
           gh release upload "$TAG" out/$ID.mbtiles out/$ID.route.gz out/$ID.search.gz out/$ID.json --clobber
 
   index:
     needs: build
     if: always()
     runs-on: ubuntu-latest
+    concurrency:
+      group: pack-index
+      cancel-in-progress: false
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -142,24 +181,35 @@ jobs:
       - name: Index
         run: |
           mkdir -p idx && cd idx
-          for t in $(gh release list --limit 300 --json tagName --jq '.[].tagName' | grep '^pack-'); do
+          gh release list --limit 1000 --json tagName --jq '.[].tagName' | grep '^pack-' > tags.txt || true
+          wc -l tags.txt
+          while read t; do
             id="${t#pack-}"
             gh release download "$t" -p "$id.json" --clobber || true
-          done
+          done < tags.txt
           python3 - <<'EOF'
           import json, glob, os, datetime
           repo = os.environ['GITHUB_REPOSITORY']
           base = f'https://github.com/{repo}/releases/download'
+          names = {'asia': 'Asia', 'europe': 'Europe', 'north-america': 'North America', 'south-america': 'South America',
+                   'central-america': 'Central America', 'australia-oceania': 'Oceania'}
           packs = []
           for fn in sorted(glob.glob('*.json')):
               p = json.load(open(fn))
-              for k, v in p['files'].items():
+              if 'files' not in p:
+                  continue
+              for v in p['files'].values():
                   v['url'] = f"{base}/pack-{p['id']}/{v['file']}"
+              p.setdefault('country', p.get('name', p['id']))
+              p.setdefault('continent', 'asia')
+              p['continentName'] = names.get(p['continent'], p['continent'])
+              p['size'] = sum(v['size'] for v in p['files'].values())
               packs.append(p)
-          idx = {'version': 1, 'updated': datetime.date.today().isoformat(), 'fonts': f'{base}/fonts-lite/fonts.zip',
+          packs.sort(key=lambda p: (p['continentName'], p['country'], p['name']))
+          idx = {'version': 2, 'updated': datetime.date.today().isoformat(), 'fonts': f'{base}/fonts-lite/fonts.zip',
                  'attribution': '© OpenStreetMap contributors', 'packs': packs}
-          json.dump(idx, open('index.json', 'w'), indent=1)
-          print(json.dumps(idx, indent=1))
+          json.dump(idx, open('index.json', 'w'), separators=(',', ':'))
+          print(len(packs), 'packs in index')
           EOF
           gh release view index >/dev/null 2>&1 || gh release create index --title "Pack index" --notes "List of available map packs (read by the app)."
           gh release upload index index.json --clobber
