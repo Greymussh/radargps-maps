@@ -1,0 +1,128 @@
+name: Build terrain
+
+# Adds the terrain add-on (3D mountains, hill shading, contour lines) to packs that are already built.
+# "packs": ids, countries, continents or all (comma separated). Packs that already have terrain are skipped unless "redo" is yes.
+on:
+  workflow_dispatch:
+    inputs:
+      packs:
+        description: 'Packs: ids, countries, continents or all'
+        required: false
+        default: 'georgia'
+      redo:
+        description: 'Rebuild terrain that already exists (yes/no)'
+        required: false
+        default: 'no'
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      count: ${{ steps.m.outputs.count }}
+    steps:
+      - id: m
+        env:
+          PACKS: ${{ github.event.inputs.packs }}
+          REDO: ${{ github.event.inputs.redo }}
+        run: |
+          curl -sfL "https://github.com/$GITHUB_REPOSITORY/releases/download/index/index.json" -o index.json
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os, sys
+          packs = json.load(open('index.json'))['packs']
+          want = [w.strip() for w in os.environ['PACKS'].split(',') if w.strip()]
+          low = lambda s: (s or '').lower().replace(' ', '-')
+          sel = [p for p in packs if any(low(w) in {low(p['id']), low(p.get('country')), low(p.get('continent')), 'all'} for w in want)]
+          if os.environ.get('REDO', 'no') != 'yes':
+              sel = [p for p in sel if 'dem' not in p.get('files', {})]
+          sel = [{'id': p['id']} for p in sel][:250]
+          print('terrain for', len(sel), 'packs', file=sys.stderr)
+          print('matrix=' + json.dumps({'pack': sel}))
+          print('count=' + str(len(sel)))
+          EOF
+
+  terrain:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    name: terrain ${{ matrix.pack.id }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ID: ${{ matrix.pack.id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          pip install pillow
+          mkdir -p out && cd out
+          gh release download "pack-$ID" -p "$ID.search.gz" -p "$ID.json" --clobber
+          gunzip -f $ID.search.gz
+          cd ..
+          python3 scripts/build_dem.py out/$ID.search $ID out
+          ls -la out
+      - name: Publish
+        run: |
+          cd out
+          python3 - <<'EOF'
+          import json, os
+          pid = os.environ['ID']
+          info = json.load(open(pid + '.json'))
+          info['files']['dem'] = {'file': pid + '.dem.mbtiles', 'size': os.path.getsize(pid + '.dem.mbtiles')}
+          json.dump(info, open(pid + '.json', 'w'), indent=1)
+          print(info['files'])
+          EOF
+          gh release upload "pack-$ID" $ID.dem.mbtiles $ID.json --clobber
+
+  index:
+    needs: terrain
+    if: always()
+    runs-on: ubuntu-latest
+    concurrency:
+      group: pack-index
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Index
+        run: |
+          mkdir -p idx && cd idx
+          gh release list --limit 1000 --json tagName --jq '.[].tagName' | grep '^pack-' > tags.txt || true
+          wc -l tags.txt
+          while read t; do
+            id="${t#pack-}"
+            gh release download "$t" -p "$id.json" --clobber || true
+          done < tags.txt
+          python3 - <<'EOF'
+          import json, glob, os, datetime
+          repo = os.environ['GITHUB_REPOSITORY']
+          base = f'https://github.com/{repo}/releases/download'
+          names = {'asia': 'Asia', 'europe': 'Europe', 'north-america': 'North America', 'south-america': 'South America',
+                   'central-america': 'Central America', 'australia-oceania': 'Oceania'}
+          packs = []
+          for fn in sorted(glob.glob('*.json')):
+              p = json.load(open(fn))
+              if 'files' not in p:
+                  continue
+              for v in p['files'].values():
+                  v['url'] = f"{base}/pack-{p['id']}/{v['file']}"
+              p.setdefault('country', p.get('name', p['id']))
+              p.setdefault('continent', 'asia')
+              p['continentName'] = names.get(p['continent'], p['continent'])
+              p['size'] = sum(v['size'] for k, v in p['files'].items() if k != 'dem')
+              packs.append(p)
+          packs.sort(key=lambda p: (p['continentName'], p['country'], p['name']))
+          idx = {'version': 2, 'updated': datetime.date.today().isoformat(), 'fonts': f'{base}/fonts-lite/fonts.zip',
+                 'attribution': '© OpenStreetMap contributors', 'packs': packs}
+          json.dump(idx, open('index.json', 'w'), separators=(',', ':'))
+          print(len(packs), 'packs in index')
+          EOF
+          gh release upload index index.json --clobber
