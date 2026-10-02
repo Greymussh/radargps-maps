@@ -82,7 +82,10 @@ def main(out='regions.json'):
             for k in kids[p['id']]:
                 add(k, continent, country)
             return
-        packs.append(dict(id=p['id'].replace('/', '-'), region=path_of(p), name=p['name'], country=country,
+        name = p['name']
+        if '/' in name:                      # US states are named like 'us/new-york'
+            name = name.split('/')[-1].replace('-', ' ').title().replace(' Of ', ' of ')
+        packs.append(dict(id=p['id'].replace('/', '-'), region=path_of(p), name=name, country=country,
                           continent=continent, mb=round(mb or 0, 1)))
 
     for cid, cname in CONTINENTS.items():
