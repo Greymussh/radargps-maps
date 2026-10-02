@@ -27,7 +27,7 @@ FORMAT of .route (little endian):
 
 Text normalisation (norm()) MUST stay identical to Pack.norm() in the Android app.
 """
-import json, math, os, re, sqlite3, struct, sys, unicodedata
+import base64, json, math, os, re, sqlite3, struct, sys, unicodedata, zlib
 from array import array
 import osmium
 
@@ -307,7 +307,7 @@ DROP_TAGS = ('name:ka', 'name:ru', 'public_transport', 'station', 'addr:housenum
 KIND = {'place': 1, 'poi': 2, 'street': 3, 'address': 4}
 
 
-def build_search(c, out_path, bbox):
+def build_search(c, out_path, bbox, cells=None):
     if os.path.exists(out_path):
         os.remove(out_path)
     db = sqlite3.connect(out_path)
@@ -376,11 +376,41 @@ def build_search(c, out_path, bbox):
       CREATE INDEX places_addr ON places(sid, name) WHERE kind=4;
     ''')
     db.executemany('INSERT INTO meta VALUES(?,?)', [('version', '2'), ('bbox', json.dumps(bbox)),
-                                                     ('places', str(len(rows)))])
+                                                     ('places', str(len(rows)))] + ([('cells', json.dumps(cells))] if cells else []))
     db.commit()
     db.execute('VACUUM')
     db.close()
     return len(rows), len(toks), len(sp)
+
+
+CELL = 0.05   # degrees
+
+
+def coverage(c, bbox):
+    """Which ~5 km cells of the bbox this pack really covers (roads/places, grown by one cell).
+    Neighbouring packs (e.g. US states) have overlapping boxes; the app uses this to pick the right one."""
+    w, s_, e, n = bbox
+    cols, rows = max(1, int(math.ceil((e - w) / CELL))), max(1, int(math.ceil((n - s_) / CELL)))
+    hit = bytearray(cols * rows)
+
+    def mark(lat, lon):
+        x, y = int((lon - w) / CELL), int((lat - s_) / CELL)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                xx, yy = x + dx, y + dy
+                if 0 <= xx < cols and 0 <= yy < rows:
+                    hit[yy * cols + xx] = 1
+    for wy in c.ways:
+        for lat, lon in wy[1][::3] + [wy[1][-1]]:
+            mark(lat, lon)
+    for p in c.places:
+        mark(p['lat'], p['lon'])
+    bits = bytearray((cols * rows + 7) // 8)
+    for i, h in enumerate(hit):
+        if h:
+            bits[i >> 3] |= 1 << (i & 7)
+    return dict(cell=CELL, west=w, south=s_, cols=cols, rows=rows,
+                bits=base64.b64encode(zlib.compress(bytes(bits), 9)).decode())
 
 
 def main():
@@ -400,8 +430,9 @@ def main():
         bbox = [lons[k] - 0.05, lats[k] - 0.05, lons[-1 - k] + 0.05, lats[-1 - k] + 0.05]
     else:
         bbox = [0, 0, 0, 0]
+    cells = coverage(c, bbox)
     g = build_graph(c, os.path.join(out, pid + '.route'))
-    s = build_search(c, os.path.join(out, pid + '.search'), bbox)
+    s = build_search(c, os.path.join(out, pid + '.search'), bbox, cells)
     info = dict(id=pid, bbox=[round(x, 5) for x in bbox], vertices=g[0], edges=g[1], points=g[2], places=s[0])
     with open(os.path.join(out, pid + '.json'), 'w') as f:
         json.dump(info, f)
