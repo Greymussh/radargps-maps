@@ -128,7 +128,7 @@ jobs:
       - name: Terrain (3D mountains, contours)
         continue-on-error: true
         run: |
-          pip install pillow
+          pip install pillow numpy
           timeout 80m python3 scripts/build_dem.py out/$ID.search $ID out
       - name: Package
         run: |
