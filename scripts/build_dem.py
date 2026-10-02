@@ -10,6 +10,7 @@ usage: build_dem.py <pack.search> <id> <out_dir> [maxzoom=10]
 writes <out_dir>/<id>.dem.mbtiles
 """
 import base64, io, json, math, os, sqlite3, sys, time, urllib.request, zlib
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 
@@ -61,13 +62,38 @@ def fetch(z, x, y):
             b_ = b_.point(lambda v: 0)
             im = Image.merge('RGB', (r_, g_, b_))
             out = io.BytesIO(); im.save(out, 'WEBP', lossless=True, quality=100, method=4)
-            return z, x, y, out.getvalue()
+            peaks = find_peaks(im, z, x, y) if z == PEAK_Z else []
+            return z, x, y, out.getvalue(), peaks
         except urllib.error.HTTPError as e:
-            if e.code == 404: return z, x, y, None
+            if e.code == 404: return z, x, y, None, []
             time.sleep(1 + k)
         except Exception:
             time.sleep(1 + k)
-    return z, x, y, None
+    return z, x, y, None, []
+
+
+PEAK_Z = 10
+
+
+def find_peaks(im, z, x, y):
+    """Summits for the map (spot heights): the highest point of each 8x8 px block (~1 km) that is also the highest
+    in the surrounding 3x3 blocks and stands at least 40 m above the lowest point around it."""
+    a = np.asarray(im, dtype=np.int32)
+    ele = a[:, :, 0] * 256 + a[:, :, 1] - 32768
+    B = 8; n = 256 // B
+    blk = ele.reshape(n, B, n, B).transpose(0, 2, 1, 3).reshape(n, n, B * B)
+    bmax, bmin, barg = blk.max(2), blk.min(2), blk.argmax(2)
+    out = []
+    for by in range(n):
+        for bx in range(n):
+            y0, y1, x0, x1 = max(0, by - 1), min(n, by + 2), max(0, bx - 1), min(n, bx + 2)
+            m = bmax[by, bx]
+            if m < 200 or m < bmax[y0:y1, x0:x1].max(): continue
+            if m - bmin[y0:y1, x0:x1].min() < 40: continue
+            py, px = by * B + barg[by, bx] // B, bx * B + barg[by, bx] % B
+            gx, gy = x + (px + 0.5) / 256, y + (py + 0.5) / 256
+            out.append((round(y2lat(gy, z), 5), round(x2lon(gx, z), 5), int(m)))
+    return out
 
 
 def main():
@@ -88,17 +114,21 @@ def main():
     db = sqlite3.connect(path)
     db.executescript('''PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;
       CREATE TABLE metadata(name TEXT, value TEXT);
-      CREATE TABLE tiles(zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB);''')
+      CREATE TABLE tiles(zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB);
+      CREATE TABLE peaks(lat REAL, lon REAL, ele INTEGER);''')
     db.executemany('INSERT INTO metadata VALUES(?,?)', [('name', pid + ' terrain'), ('format', 'webp'), ('encoding', 'terrarium'),
         ('minzoom', str(MINZ)), ('maxzoom', str(maxz)), ('bounds', ','.join(map(str, bbox))),
         ('attribution', 'Terrain Tiles: Mapzen / AWS Open Data (SRTM, GMTED2010, ETOPO1, NED and others)')])
     n_ok = size = 0
     with ThreadPoolExecutor(24) as ex:
-        for z, x, y, data in ex.map(lambda j: fetch(*j), jobs):
+        for z, x, y, data, pk in ex.map(lambda j: fetch(*j), jobs):
+            if pk: db.executemany('INSERT INTO peaks VALUES(?,?,?)', pk)
             if data is None: continue
             db.execute('INSERT INTO tiles VALUES(?,?,?,?)', (z, x, (1 << z) - 1 - y, sqlite3.Binary(data)))
             n_ok += 1; size += len(data)
     db.execute('CREATE UNIQUE INDEX tile_index ON tiles(zoom_level, tile_column, tile_row)')
+    db.execute('CREATE INDEX peaks_ll ON peaks(lat, lon)')
+    print(db.execute('select count(*) from peaks').fetchone()[0], 'peaks', file=sys.stderr)
     db.commit(); db.execute('VACUUM'); db.close()
     print(json.dumps({'tiles': n_ok, 'bytes': os.path.getsize(path)}))
 
