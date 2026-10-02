@@ -61,7 +61,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build
         run: |
-          pip install pillow
+          pip install pillow numpy
           mkdir -p out && cd out
           gh release download "pack-$ID" -p "$ID.search.gz" -p "$ID.json" --clobber
           gunzip -f $ID.search.gz
