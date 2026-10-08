@@ -130,6 +130,8 @@ class Collector(osmium.SimpleHandler):
         self.addrs = {}
         self.street_pts = {}    # (cell, name) -> (lat, lon)
         self.node_use = {}
+        self.signals = []      # traffic lights (lat, lon)
+        self.cameras = []      # speed cameras (lat, lon, limit km/h or 0)
 
     # -- helpers
     def add_poi(self, t, lat, lon):
@@ -168,6 +170,13 @@ class Collector(osmium.SimpleHandler):
         if not loc.valid():
             return
         lat, lon = loc.lat, loc.lon
+        if t.get('highway') == 'speed_camera' or (t.get('enforcement') == 'maxspeed' and t.get('device')):
+            self.cameras.append((lat, lon, parse_speed(t.get('maxspeed')) or 0))
+            return
+        if t.get('highway') == 'traffic_signals' or t.get('crossing') == 'traffic_signals':
+            self.signals.append((lat, lon))
+            if t.get('highway') == 'traffic_signals':
+                return
         if 'place' in t and t.get('name') and t['place'] in PLACE_RANK:
             self.places.append(dict(name=t['name'], name_en=t.get('name:en') or '', kind='place', sub=t['place'],
                                     key='place', lat=lat, lon=lon, rank=PLACE_RANK[t['place']], tags={}, addr=''))
@@ -319,6 +328,8 @@ def build_search(c, out_path, bbox, cells=None):
                           lat INTEGER, lon INTEGER, rank INTEGER, sid INTEGER, tags TEXT);
       CREATE TABLE tok(t TEXT, id INTEGER, PRIMARY KEY(t, id)) WITHOUT ROWID;
       CREATE TABLE spts(c INTEGER, sid INTEGER, lat INTEGER, lon INTEGER, PRIMARY KEY(c, sid)) WITHOUT ROWID;
+      CREATE TABLE signals(lat INTEGER, lon INTEGER);
+      CREATE TABLE cameras(lat INTEGER, lon INTEGER, speed INTEGER);
     ''')
     # street names, stored once
     sids = {}
@@ -371,8 +382,24 @@ def build_search(c, out_path, bbox, cells=None):
     for (cell, name), (lat, lon) in c.street_pts.items():
         sp.append(((cell[0] + 100000) * 1000000 + (cell[1] + 100000), sid_of(name), E6(lat), E6(lon)))
     db.executemany('INSERT OR IGNORE INTO spts VALUES(?,?,?,?)', sp)
+    # traffic lights (shown on the map; one row per light, close duplicates merged)
+    seen = set(); sig = []
+    for lat, lon in getattr(c, 'signals', []):
+        k = (round(lat * 4000), round(lon * 4000))   # ~25 m buckets
+        if k in seen: continue
+        seen.add(k); sig.append((E6(lat), E6(lon)))
+    db.executemany('INSERT INTO signals VALUES(?,?)', sig)
+    # speed cameras (warned about while driving)
+    seen = set(); cam = []
+    for lat, lon, lim in getattr(c, "cameras", []):
+        k = (round(lat * 4000), round(lon * 4000))
+        if k in seen: continue
+        seen.add(k); cam.append((E6(lat), E6(lon), int(lim or 0)))
+    db.executemany('INSERT INTO cameras VALUES(?,?,?)', cam)
     db.executescript('''
       CREATE INDEX places_ll ON places(lat, lon);
+      CREATE INDEX signals_ll ON signals(lat, lon);
+      CREATE INDEX cameras_ll ON cameras(lat, lon);
       CREATE INDEX places_addr ON places(sid, name) WHERE kind=4;
     ''')
     db.executemany('INSERT INTO meta VALUES(?,?)', [('version', '2'), ('bbox', json.dumps(bbox)),
