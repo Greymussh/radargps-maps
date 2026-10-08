@@ -86,7 +86,7 @@ jobs:
       CONTINENT: ${{ matrix.pack.continent }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
@@ -146,8 +146,17 @@ jobs:
                       unpacked={'route': os.path.getsize(pid + '.route'), 'search': os.path.getsize(pid + '.search')})
           if os.path.exists(pid + '.dem.mbtiles'):
               info['files']['dem'] = f(pid + '.dem.mbtiles')
+          # GitHub release files must be under 2 GB: a bigger map is split into parts (the app joins them again)
+          import subprocess
+          m = info['files']['map']
+          if m['size'] >= 1_900_000_000:
+              subprocess.check_call(['split', '-b', '1900000000', '-d', '-a', '2', pid + '.mbtiles', pid + '.mbtiles.part'])
+              m['parts'] = sorted(n for n in os.listdir('.') if n.startswith(pid + '.mbtiles.part'))
+              os.remove(pid + '.mbtiles')
+              print('map split into', m['parts'])
           for v in info['files'].values():
-              assert v['size'] < 2_000_000_000, 'file too big for a GitHub release: ' + v['file']
+              for n in v.get('parts', [v['file']]):
+                  assert os.path.getsize(n) < 2_000_000_000, 'file too big for a GitHub release: ' + n
           json.dump(info, open(pid + '.json', 'w'), indent=1)
           print(json.dumps(info, indent=1))
           EOF
@@ -156,7 +165,8 @@ jobs:
           TAG="pack-$ID"
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Map pack: $PNAME ($COUNTRY)" --notes "Offline map pack for $REGION. Map data © OpenStreetMap contributors (ODbL)."
           EXTRA=""; [ -f out/$ID.dem.mbtiles ] && EXTRA="out/$ID.dem.mbtiles"
-          gh release upload "$TAG" out/$ID.mbtiles out/$ID.route.gz out/$ID.search.gz out/$ID.json $EXTRA --clobber
+          MAPS=$(ls out/$ID.mbtiles out/$ID.mbtiles.part* 2>/dev/null)
+          gh release upload "$TAG" $MAPS out/$ID.route.gz out/$ID.search.gz out/$ID.json $EXTRA --clobber
 
   index:
     needs: build
@@ -208,6 +218,9 @@ jobs:
                   continue
               for v in p['files'].values():
                   v['url'] = f"{base}/pack-{p['id']}/{v['file']}"
+                  if v.get('parts'):   # map split into parts (over 2 GB)
+                      v['urls'] = [f"{base}/pack-{p['id']}/{n}" for n in v['parts']]
+                      v['url'] = v['urls'][0]
               p.setdefault('country', p.get('name', p['id']))
               p.setdefault('continent', 'asia')
               p['continentName'] = names.get(p['continent'], p['continent'])
