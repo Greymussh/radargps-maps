@@ -165,7 +165,7 @@ jobs:
           TAG="pack-$ID"
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Map pack: $PNAME ($COUNTRY)" --notes "Offline map pack for $REGION. Map data © OpenStreetMap contributors (ODbL)."
           EXTRA=""; [ -f out/$ID.dem.mbtiles ] && EXTRA="out/$ID.dem.mbtiles"
-          MAPS=$(ls out/$ID.mbtiles out/$ID.mbtiles.part* 2>/dev/null)
+          MAPS=$(ls out/$ID.mbtiles out/$ID.mbtiles.part* 2>/dev/null || true)   # one of the two never exists
           gh release upload "$TAG" $MAPS out/$ID.route.gz out/$ID.search.gz out/$ID.json $EXTRA --clobber
 
   index:
