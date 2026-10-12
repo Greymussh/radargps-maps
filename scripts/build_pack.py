@@ -95,17 +95,24 @@ def parse_speed(v):
 
 
 def car_ok(t):
+    """False if cars can't use the way, else a speed cap in km/h (0 = no cap).
+    Driveways, parking aisles and private yards are kept but very slow, so a route can reach a courtyard
+    or leave one, yet never cuts through them as a shortcut between streets."""
     hw = t.get('highway')
     if hw not in SPEED:
         return False
     if t.get('area') == 'yes':
         return False
-    if hw == 'service' and t.get('service') in ('parking_aisle', 'driveway', 'emergency_access'):
+    if hw == 'service' and t.get('service') == 'emergency_access':
         return False
     acc = t.get('motorcar') or t.get('motor_vehicle') or t.get('vehicle') or t.get('access')
-    if acc in ('no', 'private', 'agricultural', 'forestry', 'delivery'):
+    if acc in ('no', 'agricultural', 'forestry'):
         return False
-    return True
+    if acc in ('private', 'delivery', 'customers', 'destination', 'permit'):
+        return 5
+    if hw == 'service' and t.get('service') in ('parking_aisle', 'driveway', 'drive-through'):
+        return 8
+    return 0
 
 
 POI_KEYS = ('amenity', 'shop', 'tourism', 'leisure', 'office', 'craft', 'healthcare', 'historic')
@@ -196,13 +203,16 @@ class Collector(osmium.SimpleHandler):
             return
         hw = t.get('highway')
         name = t.get('name') or t.get('ref')
-        if hw and car_ok(t):
+        cap = car_ok(t) if hw else False
+        if cap is not False:
             ow = t.get('oneway')
             rb = t.get('junction') in ('roundabout', 'circular')
             oneway = 1 if (ow in ('yes', 'true', '1') or (rb and ow != 'no') or (hw in ('motorway', 'motorway_link') and ow != 'no')) \
                 else (-1 if ow in ('-1', 'reverse') else 0)
             sp = parse_speed(t.get('maxspeed')) or SPEED[hw]
             sp = min(sp * 0.9, SPEED[hw] * 1.25)
+            if cap:
+                sp = min(sp, cap)
             if oneway == -1:
                 ids.reverse(); pts.reverse(); oneway = 1
             self.ways.append((ids, pts, t.get('name') or t.get('ref') or '', CLASS[hw], oneway, rb, sp))
